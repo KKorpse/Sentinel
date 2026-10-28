@@ -25,28 +25,22 @@ import socket
 import sys
 from pathlib import Path
 
-VAR_DIR_NAME = "var"
-SOCKET_FILE_NAME = "sentinel.sock"
-ENV_SOCKET_PATH = "SENTINEL_SOCKET"
+from sentinel.config import SOCKET_PATH
+from sentinel.ipc import protocol as proto
 
-ACTION_REPLY = "reply"
-STATUS_OK = "ok"
+ENV_SOCKET_PATH = "SENTINEL_SOCKET"
 
 CONNECT_TIMEOUT_SEC = 10
 RECV_CHUNK_BYTES = 64 * 1024
 
 EXIT_OK = 0
-EXIT_USAGE = 2
 EXIT_FAILED = 1
-
-BASE_DIR = Path(__file__).resolve().parent
+EXIT_USAGE = 2
 
 
 def socket_path() -> Path:
     override = os.environ.get(ENV_SOCKET_PATH, "")
-    if override:
-        return Path(override)
-    return BASE_DIR / VAR_DIR_NAME / SOCKET_FILE_NAME
+    return Path(override) if override else SOCKET_PATH
 
 
 def send(payload: dict) -> dict:
@@ -57,13 +51,15 @@ def send(payload: dict) -> dict:
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
         sock.settimeout(CONNECT_TIMEOUT_SEC)
         sock.connect(str(path))
-        sock.sendall((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
+        sock.sendall((json.dumps(payload, ensure_ascii=False)
+                      + proto.LINE_TERMINATOR).encode("utf-8"))
         buf = b""
         while not buf.endswith(b"\n"):
             chunk = sock.recv(RECV_CHUNK_BYTES)
             if not chunk:
                 break
             buf += chunk
+
     if not buf:
         raise SystemExit("Sentinel 服务没有返回内容")
     return json.loads(buf.decode("utf-8"))
@@ -84,21 +80,17 @@ def cmd_reply(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return EXIT_USAGE
 
-    payload = {
-        "action": ACTION_REPLY,
-        "task_id": args.task_id,
-        "content": content,
-    }
+    image_b64 = ""
     if args.image:
         image_path = Path(args.image)
         if not image_path.is_file():
             print(f"图片不存在: {image_path}", file=sys.stderr)
             return EXIT_USAGE
-        payload["image_base64"] = base64.b64encode(image_path.read_bytes()).decode("ascii")
+        image_b64 = base64.b64encode(image_path.read_bytes()).decode("ascii")
 
-    resp = send(payload)
+    resp = send(proto.reply_request(args.task_id, content, image_b64))
     print(json.dumps(resp, ensure_ascii=False, indent=2))
-    return EXIT_OK if resp.get("status") == STATUS_OK else EXIT_FAILED
+    return EXIT_OK if proto.succeeded(resp) else EXIT_FAILED
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -106,7 +98,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="sentinel-cli", description="Sentinel 人工审批网关 CLI")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    reply = sub.add_parser(ACTION_REPLY, help="回传任务结果（会先送审）")
+    reply = sub.add_parser(proto.ACTION_REPLY, help="回传任务结果（会先送审）")
     reply.add_argument("--task-id", required=True, help="Sentinel 任务 ID，如 SENT-xxxx")
     reply.add_argument("--content", help="回复内容")
     reply.add_argument("--content-stdin", action="store_true", help="从标准输入读回复内容")
