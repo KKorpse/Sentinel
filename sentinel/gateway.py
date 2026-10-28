@@ -52,6 +52,9 @@ INVISIBLE_CHARS = ("\u2005", "\u200b", "\u00a0", "\ufe0f")
 # 群里正文会带 @ 提及其本身，形如 `@机器人名` / `@昵称 @机器人名`，判定前要先剥掉
 MENTION_PATTERN = re.compile(r"@[^\s@]+")
 
+# 出站回复被拒绝时，自动在任务下评论这句，让 Agent 重做
+REJECT_COMMENT = "我对你的回复不满意，再想想"
+
 # 回复序号：首条落在原消息气泡里，之后的脱离气泡、需自带任务标题
 FIRST_REPLY_SEQ = 1
 REPLY_HEADER = "**【{title}】** 追加回复 #{seq}"
@@ -304,6 +307,27 @@ class Gateway:
         if approval.media_id:
             await self._to_origin(task, cards.image(approval.media_id))
 
+    async def _reject_reply(self, task: TaskContext) -> None:
+        """出站被拒：不发给用户，改为在任务下评论一句不满意，让 Agent 重来。"""
+        if not task.dispatched:
+            LOG.warning("任务未建单，无法追加评论 task_id=%s", task.task_id)
+            return
+
+        try:
+            await multica.add_comment(
+                issue_id=task.issue_id,
+                content=prompts.comment(task.task_id, REJECT_COMMENT),
+            )
+        except Exception:
+            LOG.exception("拒绝后追加评论失败 task_id=%s issue=%s",
+                          task.task_id, task.issue_id)
+            await self._notify_approver(
+                f"任务 `{task.task_id}` 拒绝意见提交失败，请手动评论。")
+            return
+
+        LOG.info("已追加拒绝意见 task_id=%s issue=%s", task.task_id, task.issue_id)
+        self.store.mark_replied(task.task_id)
+
     # ---------- 审批人追问 ----------
 
     def _digest_text(self) -> str:
@@ -479,7 +503,8 @@ class Gateway:
         elif approved:
             self.client.spawn(self._deliver(task, approval))
         else:
-            LOG.info("回复被拒绝，不下发 task_id=%s", task.task_id)
+            LOG.info("回复被拒绝，转成评论让 Agent 重做 task_id=%s", task.task_id)
+            self.client.spawn(self._reject_reply(task))
 
     async def _on_enter_chat(self, req_id: str, body: dict) -> None:
         await self.client.respond(req_id, cards.markdown(
