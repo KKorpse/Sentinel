@@ -23,10 +23,10 @@ from .wecom.client import BotClient
 LOG = logger("gateway")
 
 # 气泡在各阶段的文案。{approver} 是审批人的展示名
-TEXT_WAITING = "已收到，等待 {approver} 审核请求中..."
-TEXT_APPROVING = "{approver} 审核通过，让我琢磨琢磨..."
-TEXT_REVIEWING = "我搞定了，等 {approver} 审核结果..."
-TEXT_REWORKING = "{approver} 对结果不满意，我继续琢磨琢磨..."
+TEXT_WAITING = "🙏 俺已收到，等待 {approver} 审核请求中..."
+TEXT_APPROVING = "🫡 {approver} 审核通过，让我琢磨琢磨..."
+TEXT_REVIEWING = "✋ 我搞定了，等 {approver} 审核结果..."
+TEXT_REWORKING = "😮‍💨 {approver} 对结果不满意，我继续琢磨琢磨..."
 TEXT_REJECTED = "{approver} 拒绝了这条请求。"
 
 # 审批人私聊里用 `/{任务id}` 指定追问目标，不带则沿用上一个任务
