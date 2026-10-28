@@ -6,6 +6,7 @@
 """
 
 import asyncio
+import re
 from pathlib import Path
 
 from . import multica, prompts
@@ -47,7 +48,9 @@ Agent 干完之后，我再把结果拿给 {approver} 审一遍，{approver} 满
 
 # @ 了但没给正文时，机器人收到的内容可能只剩 @ 与不可见字符
 EMPTY_CONTENT_TOKENS = ("", "@")
-INVISIBLE_CHARS = ("\u2005", "\u200b", "\u00a0")
+INVISIBLE_CHARS = ("\u2005", "\u200b", "\u00a0", "\ufe0f")
+# 群里正文会带 @ 提及其本身，形如 `@机器人名` / `@昵称 @机器人名`，判定前要先剥掉
+MENTION_PATTERN = re.compile(r"@[^\s@]+")
 
 # 回复序号：首条落在原消息气泡里，之后的脱离气泡、需自带任务标题
 FIRST_REPLY_SEQ = 1
@@ -65,12 +68,17 @@ PLACEHOLDER_EMPTY = "-"
 DIGEST_EMPTY = "无"
 
 
-def is_help_command(text: str) -> bool:
-    """`/help`、@ 了没给正文，都算求助；正文只可能是 @ 与不可见字符时视为空。"""
-    normalized = text.strip()
+def strip_mentions(text: str) -> str:
+    """去掉正文里的 @ 提及，只留用户真正说的话。"""
+    cleaned = MENTION_PATTERN.sub(" ", text)
     for char in INVISIBLE_CHARS:
-        normalized = normalized.replace(char, "")
-    normalized = normalized.strip()
+        cleaned = cleaned.replace(char, "")
+    return " ".join(cleaned.split())
+
+
+def is_help_command(text: str) -> bool:
+    """`/help`、@ 了没给正文，都算求助。群里正文自带 `@机器人名`，先剥掉再判定。"""
+    normalized = strip_mentions(text)
     if normalized in EMPTY_CONTENT_TOKENS:
         return True
     return normalized.lower() in HELP_COMMANDS
