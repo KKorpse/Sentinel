@@ -149,6 +149,11 @@ MULTICA_TIMEOUT_SEC = 120
 VAR_DIR_NAME = "var"
 ATTACHMENT_DIR_NAME = "attachments"
 SOCKET_FILE_NAME = "sentinel.sock"
+STATE_FILE_NAME = "state.json"
+STATE_TMP_SUFFIX = ".tmp"
+STATE_FIELD_REQUESTS = "requests"
+STATE_FIELD_APPROVALS = "approvals"
+STATE_FIELD_LAST_REPLIED = "last_replied_task"
 
 IPC_ACTION_REPLY = "reply"
 IPC_STATUS_OK = "ok"
@@ -437,6 +442,46 @@ class SentinelGateway:
 
         self._attach_dir = BASE_DIR / VAR_DIR_NAME / ATTACHMENT_DIR_NAME
         self._attach_dir.mkdir(parents=True, exist_ok=True)
+        self._state_path = BASE_DIR / VAR_DIR_NAME / STATE_FILE_NAME
+        self._load_state()
+
+    # ---------- 状态持久化 ----------
+
+    def _load_state(self) -> None:
+        """重启后恢复任务上下文与待办审批，否则审批人追问会找不到任务。"""
+        if not self._state_path.exists():
+            return
+        try:
+            state = json.loads(self._state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            LOG.exception("状态文件损坏，忽略 %s", self._state_path)
+            return
+
+        self._requests = state.get(STATE_FIELD_REQUESTS, {})
+        self._approvals = state.get(STATE_FIELD_APPROVALS, {})
+        self._last_replied_task = state.get(STATE_FIELD_LAST_REPLIED, "")
+
+        # 气泡依附于上一条连接的回调，重启后无法再刷，一律视为已收尾
+        for ctx in self._requests.values():
+            ctx["stream_done"] = True
+            ctx["stream_deadline"] = 0.0
+
+        LOG.info("已恢复状态 requests=%s approvals=%s last=%s",
+                 len(self._requests), len(self._approvals), self._last_replied_task)
+
+    def _save_state(self) -> None:
+        """全量落盘。量级是几百条纯文本，直接整写，避免增量带来的一致性问题。"""
+        state = {
+            STATE_FIELD_REQUESTS: self._requests,
+            STATE_FIELD_APPROVALS: self._approvals,
+            STATE_FIELD_LAST_REPLIED: self._last_replied_task,
+        }
+        tmp = self._state_path.with_suffix(STATE_TMP_SUFFIX)
+        try:
+            tmp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(self._state_path)  # 原子替换，避免半截文件
+        except OSError:
+            LOG.exception("状态落盘失败 %s", self._state_path)
 
     # ---------- 底层收发 ----------
 
@@ -643,12 +688,24 @@ class SentinelGateway:
         path.write_bytes(image)
         return path
 
+    @staticmethod
+    def _read_attachment(path_str: str) -> bytes | None:
+        """图片存盘不存内存，重启后仍可重新上传。"""
+        if not path_str:
+            return None
+        path = Path(path_str)
+        if not path.is_file():
+            LOG.warning("附件已丢失 %s", path)
+            return None
+        return path.read_bytes()
+
     # ---------- 审批单 ----------
 
     def _track_request(self, ctx: dict) -> None:
         while len(self._requests) >= MAX_TRACKED_REQUESTS:
             self._requests.pop(next(iter(self._requests)))
         self._requests[ctx["task_id"]] = ctx
+        self._save_state()
 
     def _approval_card(self, approval_id: str, title: str, desc: str,
                        detail: str, rows: list[tuple[str, str]]) -> dict:
@@ -696,14 +753,17 @@ class SentinelGateway:
             "kind": APPROVAL_KIND_INBOUND,
             "task_id": ctx["task_id"],
         }
+        self._save_state()
 
         await self._push_to_user(self.approver, self._markdown(
             f"**待确认请求** `{ctx['task_id']}`\n"
             f"来自 {ctx['from']}（{ctx['chattype']}）\n\n{ctx['request']}"))
 
-        if ctx["image"] and not ctx["media_id"]:
+        image = self._read_attachment(ctx["image_path"])
+        if image and not ctx["media_id"]:
             try:
-                ctx["media_id"] = await self._upload_media(ctx["image"])
+                ctx["media_id"] = await self._upload_media(image)
+                self._save_state()
             except Exception:
                 LOG.exception("上传请求图片失败 task_id=%s", ctx["task_id"])
         if ctx["media_id"]:
@@ -721,7 +781,7 @@ class SentinelGateway:
                     ("发起人", ctx["from"]),
                     ("会话", ctx["chattype"]),
                     ("类型", msg_type_name(ctx["msgtype"])),
-                    ("图片", "有" if ctx["image"] else "无"),
+                    ("图片", "有" if ctx["image_path"] else "无"),
                 ],
             ),
         })
@@ -737,6 +797,7 @@ class SentinelGateway:
             "media_id": "",
         }
         self._approvals[approval_id] = record
+        self._save_state()
 
         await self._push_to_user(self.approver, self._markdown(
             f"**待确认回复** `{ctx['task_id']}`\n"
@@ -745,6 +806,7 @@ class SentinelGateway:
         if image:
             try:
                 record["media_id"] = await self._upload_media(image)
+                self._save_state()
                 await self._push_to_user(self.approver, self._image(record["media_id"]))
             except Exception:
                 LOG.exception("上传回复图片失败 task_id=%s", ctx["task_id"])
@@ -767,15 +829,14 @@ class SentinelGateway:
         })
         LOG.info("回复已送审 task_id=%s approval=%s", ctx["task_id"], approval_id)
         self._last_replied_task = ctx["task_id"]
+        self._save_state()
         return approval_id
 
     # ---------- 审批放行后的动作 ----------
 
     async def _dispatch_to_agent(self, ctx: dict) -> None:
         """入站放行：建 multica 任务并指派给 Agent。"""
-        attachments = []
-        if ctx["image"]:
-            attachments.append(self._save_attachment(ctx["task_id"], ctx["image"]))
+        attachments = [Path(ctx["image_path"])] if ctx["image_path"] else []
 
         try:
             issue_id = await create_issue(
@@ -791,6 +852,7 @@ class SentinelGateway:
             return
 
         ctx["issue_id"] = issue_id
+        self._save_state()
         LOG.info("已建单 task_id=%s issue=%s assignee=%s",
                  ctx["task_id"], issue_id, self.assignee)
         await self._push_to_user(self.approver, self._markdown(
@@ -822,18 +884,29 @@ class SentinelGateway:
                 ctx, self._markdown(f"{header}\n\n{record['content']}"))
             LOG.info("第 %s 条答复已另发 task_id=%s", ctx["reply_seq"], ctx["task_id"])
 
+        self._save_state()
         if record["media_id"]:
             await self._push_to_origin(ctx, self._image(record["media_id"]))
 
     # ---------- 回调处理 ----------
 
+    def _pick_comment_target(self) -> dict | None:
+        """选追问落到哪个任务：优先最近一次回过话的，否则取最近一个已建单的。"""
+        ctx = self._requests.get(self._last_replied_task)
+        if ctx is not None and ctx.get("issue_id"):
+            return ctx
+        for candidate in reversed(list(self._requests.values())):
+            if candidate.get("issue_id"):
+                return candidate
+        return None
+
     async def _forward_as_comment(self, req_id: str, request: str,
                                   image: bytes | None) -> None:
         """审批人单聊直接发言：作为评论续到最近一次回过话的任务下，Agent 会继续处理。"""
-        ctx = self._requests.get(self._last_replied_task)
-        if ctx is None or not ctx["issue_id"]:
+        ctx = self._pick_comment_target()
+        if ctx is None:
             await self._reply_to_callback(req_id, self._markdown(
-                "当前没有可追问的任务，请等 Agent 回复过一次之后再发言。"))
+                "当前没有可追问的任务，请先在群里 @ 我发起一个任务。"))
             return
 
         attachments = []
@@ -854,6 +927,8 @@ class SentinelGateway:
             return
 
         LOG.info("已追加评论 task_id=%s issue=%s", ctx["task_id"], ctx["issue_id"])
+        self._last_replied_task = ctx["task_id"]
+        self._save_state()
         await self._reply_to_callback(req_id, self._markdown(
             f"已作为评论追加到任务 `{ctx['task_id']}`（单号 `{ctx['issue_id']}`），"
             f"Agent 处理完会再送审。"))
@@ -865,8 +940,8 @@ class SentinelGateway:
         content = extract_content(body)
         quote_text = format_quote(body.get("quote"))
 
-        LOG.info("收到消息 from=%s chattype=%s msgtype=%s content=%r quote=%r",
-                 sender, chattype, msg_type, content, quote_text)
+        LOG.info("收到消息 from=%s chattype=%s chatid=%s msgtype=%s content=%r quote=%r",
+                 sender, chattype, body.get("chatid", ""), msg_type, content, quote_text)
 
         image = await self._download_image(body)
         if image is None and body.get("quote"):
@@ -878,8 +953,9 @@ class SentinelGateway:
                 req_id, compose_request(content, quote_text), image)
             return
 
+        task_id = new_task_id()
         ctx = {
-            "task_id": new_task_id(),
+            "task_id": task_id,
             "from": sender,
             "chattype": chattype,
             "chatid": body.get("chatid", ""),
@@ -888,7 +964,8 @@ class SentinelGateway:
             "content": content,
             "quote": quote_text,
             "request": compose_request(content, quote_text),
-            "image": image,
+            # 图片存盘不存内存，状态才能序列化、重启后也能重新上传
+            "image_path": str(self._save_attachment(task_id, image)) if image else "",
             "media_id": "",
             "issue_id": "",
             # 流式气泡：挂在用户这条消息上，审批前后一路刷新到最终答复
@@ -934,6 +1011,7 @@ class SentinelGateway:
             LOG.warning("审批单不存在或已处理 approval=%s", approval_id)
             await close_card("该审批已失效", [("单据", approval_id)], "")
             return
+        self._save_state()
 
         ctx = self._requests.get(record["task_id"])
         if ctx is None:
