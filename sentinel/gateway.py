@@ -378,6 +378,13 @@ class Gateway:
         task.open_stream(new_stream_id(), req_id)
         self.store.add_task(task)
 
+        # 审批人自己发起的请求免审，直接派活；Agent 的回复仍要过审
+        if sender == self.approver:
+            LOG.info("审批人发起，跳过入站审批 task_id=%s", task.task_id)
+            await self._refresh_stream(task, self._text(TEXT_APPROVING), finish=False)
+            await self._dispatch_to_agent(task)
+            return
+
         await self._refresh_stream(task, self._text(TEXT_WAITING), finish=False)
         await self._ask_inbound(task)
 
