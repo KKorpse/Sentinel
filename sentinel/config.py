@@ -13,9 +13,13 @@ ENV_CONFIG_PATH = "SENTINEL_CONFIG"
 FIELD_BOT_ID = "bot_id"
 FIELD_SECRET = "secret"
 FIELD_APPROVER = "approver_userid"
+FIELD_APPROVER_NAME = "approver_name"
 FIELD_ASSIGNEE = "multica_assignee"
 REQUIRED_FIELDS = (FIELD_BOT_ID, FIELD_SECRET, FIELD_APPROVER)
 DEFAULT_ASSIGNEE = "zack"
+
+# 气泡文案里对审批人的称呼，没配就退回 userid
+EMPTY_APPROVER_NAME = ""
 
 VAR_DIR_NAME = "var"
 ATTACHMENT_DIR_NAME = "attachments"
@@ -41,6 +45,12 @@ class Config:
     secret: str
     approver_userid: str
     multica_assignee: str = DEFAULT_ASSIGNEE
+    approver_name: str = EMPTY_APPROVER_NAME
+
+    @property
+    def approver_display(self) -> str:
+        """气泡文案里对审批人的称呼。"""
+        return self.approver_name or self.approver_userid
 
 
 def config_path() -> Path:
@@ -67,6 +77,7 @@ def load_config() -> Config:
         secret=raw[FIELD_SECRET],
         approver_userid=raw[FIELD_APPROVER],
         multica_assignee=raw.get(FIELD_ASSIGNEE) or DEFAULT_ASSIGNEE,
+        approver_name=raw.get(FIELD_APPROVER_NAME) or EMPTY_APPROVER_NAME,
     )
 
 

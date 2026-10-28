@@ -22,10 +22,12 @@ from .wecom.client import BotClient
 
 LOG = logger("gateway")
 
-# 气泡在各阶段的文案
-TEXT_WAITING = "已收到，等待人工确认…"
-TEXT_APPROVED = "已通过确认，正在处理…"
-TEXT_REJECTED = "请求已被拒绝。"
+# 气泡在各阶段的文案。{approver} 是审批人的展示名
+TEXT_WAITING = "已收到，等待 {approver} 审核请求中..."
+TEXT_APPROVING = "{approver} 审核通过，让我琢磨琢磨..."
+TEXT_REVIEWING = "我搞定了，等 {approver} 审核结果..."
+TEXT_REWORKING = "{approver} 对结果不满意，我继续琢磨琢磨..."
+TEXT_REJECTED = "{approver} 拒绝了这条请求。"
 
 # 审批人私聊里用 `/{任务id}` 指定追问目标，不带则沿用上一个任务
 TARGET_TOKEN_PREFIX = "/"
@@ -66,6 +68,7 @@ class Gateway:
     def __init__(self, config: Config, store: Store | None = None,
                  url: str = p.WS_URL):
         self.approver = config.approver_userid
+        self.approver_display = config.approver_display
         self.assignee = config.multica_assignee
         self.store = store or Store()
         self.client = BotClient(
@@ -88,6 +91,10 @@ class Gateway:
         else:
             await self.client.push_to_user(task.sender, body)
             LOG.info("已送达用户 %s", task.sender)
+
+    def _text(self, template: str) -> str:
+        """气泡文案里把审批人称呼填进去。"""
+        return template.format(approver=self.approver_display)
 
     async def _to_approver(self, body: dict) -> None:
         await self.client.push_to_user(self.approver, body)
@@ -177,6 +184,9 @@ class Gateway:
             content=reply.content,
         )
         self.store.add_approval(approval)
+
+        # Agent 交活了，气泡先提示"等审核结果"
+        await self._refresh_stream(task, self._text(TEXT_REVIEWING), finish=False)
 
         await self._notify_approver(
             f"**待确认回复** `{task.task_id}`\n"
@@ -320,6 +330,9 @@ class Gateway:
 
         LOG.info("已追加评论 task_id=%s issue=%s", task.task_id, task.issue_id)
         self.store.mark_replied(task.task_id)
+
+        # 气泡已收尾过就刷不动了，此时这个提示只发在审批人单聊里
+        await self._refresh_stream(task, self._text(TEXT_REWORKING), finish=False)
         await self.client.respond(req_id, cards.markdown(
             f"已作为评论追加到任务 `{task.task_id}`（单号 `{task.issue_id}`），"
             f"Agent 处理完会再送审。"))
@@ -365,7 +378,7 @@ class Gateway:
         task.open_stream(new_stream_id(), req_id)
         self.store.add_task(task)
 
-        await self._refresh_stream(task, TEXT_WAITING, finish=False)
+        await self._refresh_stream(task, self._text(TEXT_WAITING), finish=False)
         await self._ask_inbound(task)
 
     async def _on_card_click(self, req_id: str, body: dict) -> None:
@@ -408,10 +421,11 @@ class Gateway:
 
         if approval.inbound:
             if approved:
-                self.client.spawn(self._refresh_stream(task, TEXT_APPROVED, False))
+                self.client.spawn(
+                    self._refresh_stream(task, self._text(TEXT_APPROVING), False))
                 self.client.spawn(self._dispatch_to_agent(task))
             else:
-                self.client.spawn(self._answer(task, TEXT_REJECTED))
+                self.client.spawn(self._answer(task, self._text(TEXT_REJECTED)))
         elif approved:
             self.client.spawn(self._deliver(task, approval))
         else:
