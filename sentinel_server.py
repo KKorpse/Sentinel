@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import signal
+import time
 import urllib.request
 import uuid
 from pathlib import Path
@@ -50,6 +51,7 @@ CMD_UPLOAD_MEDIA_FINISH = "aibot_upload_media_finish"
 MSG_TYPE_MARKDOWN = "markdown"
 MSG_TYPE_TEMPLATE_CARD = "template_card"
 MSG_TYPE_IMAGE = "image"
+MSG_TYPE_STREAM = "stream"
 
 MSG_KIND_TEXT = "text"
 MSG_KIND_IMAGE = "image"
@@ -116,14 +118,32 @@ APPROVAL_ID_PREFIX_INBOUND = "in_"
 APPROVAL_ID_PREFIX_OUTBOUND = "out_"
 APPROVAL_ID_RAND_LEN = 16
 
+# 卡片字段长度上限：sub_title_text 建议 <=112 字，超了服务端可能判参数非法
+CARD_SUB_TITLE_MAX_LEN = 112
+CLIP_SUFFIX = "…"
+
+# 流式气泡：官方从首次发送起算 10 分钟内必须刷完并 finish，留一点余量
+STREAM_ID_PREFIX = "stm_"
+STREAM_ID_RAND_LEN = 16
+STREAM_WINDOW_SEC = 9 * 60
+STREAM_TEXT_WAITING = "已收到，等待人工确认…"
+STREAM_TEXT_APPROVED = "已通过确认，正在处理…"
+STREAM_TEXT_REJECTED = "请求已被拒绝。"
+
+# 回复序号：首条落在原消息气泡里，之后的脱离气泡、需自带任务标题
+FIRST_REPLY_SEQ = 1
+REPLY_HEADER_TEMPLATE = "**【{title}】** 追加回复 #{seq}"
+
 # 内存里保留的请求数上限，超出按先进先出淘汰
 MAX_TRACKED_REQUESTS = 500
 
 MULTICA_BIN = "multica"
 MULTICA_SUBCMD_ISSUE_CREATE = ("issue", "create")
+MULTICA_SUBCMD_ISSUE_GET = ("issue", "get")
 MULTICA_SUBCMD_COMMENT_ADD = ("issue", "comment", "add")
 MULTICA_OUTPUT_JSON = "json"
 MULTICA_FIELD_IDENTIFIER = "identifier"
+MULTICA_FIELD_TITLE = "title"
 MULTICA_TIMEOUT_SEC = 120
 
 VAR_DIR_NAME = "var"
@@ -216,6 +236,10 @@ def new_approval_id(kind: str) -> str:
     return prefix + uuid.uuid4().hex[:APPROVAL_ID_RAND_LEN]
 
 
+def new_stream_id() -> str:
+    return STREAM_ID_PREFIX + uuid.uuid4().hex[:STREAM_ID_RAND_LEN]
+
+
 def msg_type_name(msg_type: str) -> str:
     """卡片 horizontal_content_list 的 keyname 建议 <=5 字，这里给中文短名。"""
     mapping = {
@@ -306,6 +330,14 @@ def guess_image_ext(data: bytes) -> str:
     return DEFAULT_IMAGE_EXT
 
 
+def clip(text: str, limit: int) -> str:
+    """卡片字段有长度上限，超长截断。"""
+    one_line = text.replace("\n", " ")
+    if len(one_line) <= limit:
+        return one_line
+    return one_line[: limit - len(CLIP_SUFFIX)] + CLIP_SUFFIX
+
+
 def render_issue_description(task_id: str, request: str) -> str:
     return ISSUE_DESCRIPTION_TEMPLATE.format(
         request=request,
@@ -369,6 +401,15 @@ async def add_comment(issue_id: str, content: str, attachments: list[Path]) -> N
     for path in attachments:
         argv += ["--attachment", str(path.relative_to(BASE_DIR))]
     await run_multica(argv, content)
+
+
+async def get_issue_title(issue_id: str) -> str:
+    """取任务当前标题。Agent 会按内容改标题，所以每次回复都现查，不用建单时那个占位名。"""
+    data = await run_multica(
+        [MULTICA_BIN, *MULTICA_SUBCMD_ISSUE_GET, issue_id,
+         "--output", MULTICA_OUTPUT_JSON],
+        "")
+    return data.get(MULTICA_FIELD_TITLE, "")
 
 
 # ---------------------------------------------------------------- 网关
@@ -479,6 +520,40 @@ class SentinelGateway:
         else:
             await self._push_to_user(ctx["from"], body)
             LOG.info("已送达用户 %s", ctx["from"])
+
+    # ---------- 流式气泡 ----------
+
+    def _stream_alive(self, ctx: dict) -> bool:
+        """气泡是否还能刷新：没结束，且没超过官方 10 分钟的刷新窗口。"""
+        if ctx["stream_done"] or not ctx["stream_id"]:
+            return False
+        return time.monotonic() < ctx["stream_deadline"]
+
+    async def _refresh_stream(self, ctx: dict, content: str, finish: bool) -> bool:
+        """刷新原消息的流式气泡。content 是全量替换，finish=True 后不可再刷。
+
+        req_id 必须沿用那条消息回调的 req_id，气泡才会挂在用户 @ 的那条消息上。
+        """
+        if not self._stream_alive(ctx):
+            return False
+        await self._reply_to_callback(ctx["callback_req_id"], {
+            "msgtype": MSG_TYPE_STREAM,
+            "stream": {
+                "id": ctx["stream_id"],
+                "finish": finish,
+                "content": content,
+            },
+        })
+        if finish:
+            ctx["stream_done"] = True
+        LOG.info("气泡已刷新 task_id=%s finish=%s", ctx["task_id"], finish)
+        return True
+
+    async def _answer(self, ctx: dict, content: str) -> None:
+        """把最终答复落到原消息上：气泡还活着就收尾在气泡里，否则另发一条。"""
+        if await self._refresh_stream(ctx, content, finish=True):
+            return
+        await self._push_to_origin(ctx, self._markdown(content))
 
     # ---------- 媒体 ----------
 
@@ -593,13 +668,17 @@ class SentinelGateway:
         }
 
     @staticmethod
-    def _closed_card(title: str, detail: str, rows: list[tuple[str, str]],
-                     event_key: str) -> dict:
-        """结论卡片：更新场景下 task_id 无效，故不带。"""
+    def _closed_card(approval_id: str, title: str, detail: str,
+                     rows: list[tuple[str, str]], event_key: str) -> dict:
+        """结论卡片：去掉可点按钮，只留结论。
+
+        task_id 在更新场景下不生效，但 button_interaction 的参数校验仍要求必填，
+        不带会被服务端拒成 40058，所以原样回传送审时用的那个 ID。
+        """
         return {
             "card_type": CARD_TYPE_BUTTON_INTERACTION,
-            "main_title": {"title": title, "desc": ""},
-            "sub_title_text": detail,
+            "main_title": {"title": title},
+            "sub_title_text": clip(detail, CARD_SUB_TITLE_MAX_LEN),
             "horizontal_content_list": [
                 {"keyname": key, "value": value} for key, value in rows
             ],
@@ -607,6 +686,7 @@ class SentinelGateway:
                 {"text": title, "style": BUTTON_STYLE_CONFIRM, "key": f"{event_key}_done"},
             ],
             "card_action": {"type": CARD_ACTION_TYPE_NONE},
+            "task_id": approval_id,
         }
 
     async def _ask_inbound(self, ctx: dict) -> None:
@@ -716,9 +796,32 @@ class SentinelGateway:
         await self._push_to_user(self.approver, self._markdown(
             f"任务 `{ctx['task_id']}` 已派给 **{self.assignee}**，单号 `{issue_id}`。"))
 
+    async def _reply_header(self, ctx: dict) -> str:
+        """第 N 条回复脱离了原气泡，开头补任务标题，方便对上是哪个任务。"""
+        title = ""
+        if ctx["issue_id"]:
+            try:
+                title = await get_issue_title(ctx["issue_id"])
+            except Exception:
+                LOG.exception("取任务标题失败 issue=%s", ctx["issue_id"])
+        return REPLY_HEADER_TEMPLATE.format(
+            title=title or ctx["request"],
+            seq=ctx["reply_seq"],
+        )
+
     async def _deliver_reply(self, ctx: dict, record: dict) -> None:
-        """出站放行：把 Agent 回复原样送回最初的会话。"""
-        await self._push_to_origin(ctx, self._markdown(record["content"]))
+        """出站放行：首条答复落在原消息气泡里，第 N 条带任务标题另发一条。"""
+        ctx["reply_seq"] += 1
+        first = ctx["reply_seq"] == FIRST_REPLY_SEQ
+
+        if first and await self._refresh_stream(ctx, record["content"], finish=True):
+            LOG.info("首条答复已落到气泡 task_id=%s", ctx["task_id"])
+        else:
+            header = await self._reply_header(ctx)
+            await self._push_to_origin(
+                ctx, self._markdown(f"{header}\n\n{record['content']}"))
+            LOG.info("第 %s 条答复已另发 task_id=%s", ctx["reply_seq"], ctx["task_id"])
+
         if record["media_id"]:
             await self._push_to_origin(ctx, self._image(record["media_id"]))
 
@@ -788,11 +891,17 @@ class SentinelGateway:
             "image": image,
             "media_id": "",
             "issue_id": "",
+            # 流式气泡：挂在用户这条消息上，审批前后一路刷新到最终答复
+            "callback_req_id": req_id,
+            "stream_id": new_stream_id(),
+            "stream_done": False,
+            "stream_deadline": time.monotonic() + STREAM_WINDOW_SEC,
+            # 已下发给用户的答复条数，首条走气泡，之后带标题另发
+            "reply_seq": 0,
         }
         self._track_request(ctx)
 
-        await self._reply_to_callback(req_id, self._markdown(
-            f"已收到，等待确认（任务 `{ctx['task_id']}`）。"))
+        await self._refresh_stream(ctx, STREAM_TEXT_WAITING, finish=False)
         await self._ask_inbound(ctx)
 
     async def _on_template_card_event(self, req_id: str, body: dict) -> None:
@@ -810,7 +919,8 @@ class SentinelGateway:
                 "headers": {"req_id": req_id},
                 "body": {
                     "response_type": RESPONSE_TYPE_UPDATE_TEMPLATE_CARD,
-                    "template_card": self._closed_card(title, detail, rows, event_key),
+                    "template_card": self._closed_card(
+                        approval_id, title, detail, rows, event_key),
                 },
             })
 
@@ -838,10 +948,11 @@ class SentinelGateway:
 
         if record["kind"] == APPROVAL_KIND_INBOUND:
             if approved:
+                self._spawn(self._refresh_stream(
+                    ctx, STREAM_TEXT_APPROVED, finish=False))
                 self._spawn(self._dispatch_to_agent(ctx))
             else:
-                self._spawn(self._push_to_origin(
-                    ctx, self._markdown("你的请求已被拒绝。")))
+                self._spawn(self._answer(ctx, STREAM_TEXT_REJECTED))
             return
 
         if approved:
