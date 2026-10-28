@@ -32,6 +32,23 @@ TEXT_REJECTED = "{approver} 拒绝了这条请求。"
 # 审批人私聊里用 `/{任务id}` 指定追问目标，不带则沿用上一个任务
 TARGET_TOKEN_PREFIX = "/"
 
+# `/help` 或 @ 了但没给内容时回的用法说明
+HELP_COMMANDS = ("/help", "help", "?", "/?")
+HELP_TEXT = """\
+【怎么用】
+在群里 @我 说需求，我会先把这事记下来，等 {approver} 确认后才交给 Agent 处理；
+Agent 干完之后，我再把结果拿给 {approver} 审一遍，{approver} 满意了才在群里回你。
+
+【注意】
+· 回复会挂在你 @我 的那条消息上，别找不到
+· 可以带图片，也可以引用一条消息再 @我，引用原文我一起看
+· 一个任务可能会处理比较久，也需要等 {approver} 审核，甚至多轮回炉重造，请耐心等待。\
+如果任务异常或者迟迟没出结果，直接找他"""
+
+# @ 了但没给正文时，机器人收到的内容可能只剩 @ 与不可见字符
+EMPTY_CONTENT_TOKENS = ("", "@")
+INVISIBLE_CHARS = ("\u2005", "\u200b", "\u00a0")
+
 # 回复序号：首条落在原消息气泡里，之后的脱离气泡、需自带任务标题
 FIRST_REPLY_SEQ = 1
 REPLY_HEADER = "**【{title}】** 追加回复 #{seq}"
@@ -46,6 +63,17 @@ CARD_TITLE_LOST = "原始请求已过期"
 
 PLACEHOLDER_EMPTY = "-"
 DIGEST_EMPTY = "无"
+
+
+def is_help_command(text: str) -> bool:
+    """`/help`、@ 了没给正文，都算求助；正文只可能是 @ 与不可见字符时视为空。"""
+    normalized = text.strip()
+    for char in INVISIBLE_CHARS:
+        normalized = normalized.replace(char, "")
+    normalized = normalized.strip()
+    if normalized in EMPTY_CONTENT_TOKENS:
+        return True
+    return normalized.lower() in HELP_COMMANDS
 
 
 def split_target_token(text: str) -> tuple[str, str]:
@@ -355,6 +383,13 @@ class Gateway:
         if image is None and body.get(p.KEY_QUOTE):
             image = await self._first_image(body[p.KEY_QUOTE])
 
+        # 求助优先于一切：@ 了没给内容或 /help 都回用法，不进审批也不建任务
+        if is_help_command(content):
+            LOG.info("求助 request from=%s content=%r", sender, content)
+            await self.client.respond(req_id, cards.markdown(
+                HELP_TEXT.format(approver=self.approver_display)))
+            return
+
         # 审批人单聊发言视为对 Agent 追问；群里 @ 仍按新请求走审批
         if sender == self.approver and chattype == p.CHATTYPE_SINGLE:
             await self._forward_as_comment(
@@ -439,13 +474,8 @@ class Gateway:
             LOG.info("回复被拒绝，不下发 task_id=%s", task.task_id)
 
     async def _on_enter_chat(self, req_id: str, body: dict) -> None:
-        if p.sender_of(body) == self.approver:
-            await self.client.respond(req_id, cards.markdown(
-                f"直接发言会追加到上一个任务；用 `/任务id 内容` 可指定任务。\n"
-                f"当前可指定：{self._digest_text()}"))
-        else:
-            await self.client.respond(req_id, cards.markdown(
-                "你好，发消息给我，会先转给管理员确认后再处理。"))
+        await self.client.respond(req_id, cards.markdown(
+            HELP_TEXT.format(approver=self.approver_display)))
 
     async def _on_event(self, req_id: str, body: dict) -> None:
         event_type = p.event_of(body).get(p.KEY_EVENTTYPE, "")
