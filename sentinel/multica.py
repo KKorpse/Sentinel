@@ -10,8 +10,6 @@ LOG = logger("multica")
 
 BIN = "multica"
 SUBCMD_ISSUE_CREATE = ("issue", "create")
-SUBCMD_ISSUE_GET = ("issue", "get")
-SUBCMD_ISSUE_UPDATE = ("issue", "update")
 SUBCMD_COMMENT_ADD = ("issue", "comment", "add")
 
 OPT_TITLE = "--title"
@@ -23,7 +21,6 @@ OPT_OUTPUT = "--output"
 OUTPUT_JSON = "json"
 
 FIELD_IDENTIFIER = "identifier"
-FIELD_TITLE = "title"
 
 TIMEOUT_SEC = 120
 
@@ -82,9 +79,3 @@ async def add_comment(issue_id: str, content: str,
         *_attachment_args(attachments or []),
     ]
     await run(argv, content)
-
-
-async def get_title(issue_id: str) -> str:
-    """取任务当前标题。Agent 会按内容改标题，所以每次都现查，不用建单时的占位名。"""
-    data = await run([BIN, *SUBCMD_ISSUE_GET, issue_id, OPT_OUTPUT, OUTPUT_JSON])
-    return data.get(FIELD_TITLE, "")

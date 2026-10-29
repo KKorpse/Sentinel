@@ -55,9 +55,8 @@ MENTION_PATTERN = re.compile(r"@[^\s@]+")
 # 出站回复被拒绝时，自动在任务下评论这句，让 Agent 重做
 REJECT_COMMENT = "我对你的回复不满意，再想想"
 
-# 回复序号：首条落在原消息气泡里，之后的脱离气泡、需自带任务标题
+# 回复序号：首条落在原消息气泡里，之后的气泡已收尾、只能另发一条
 FIRST_REPLY_SEQ = 1
-REPLY_HEADER = "**【{title}】** 追加回复 #{seq}"
 
 CARD_TITLE_INBOUND = "有一条新的请求待你确认"
 CARD_TITLE_OUTBOUND = "Agent 回复待你确认"
@@ -279,18 +278,8 @@ class Gateway:
         await self._notify_approver(
             f"任务 `{task.task_id}` 已派给 **{self.assignee}**，单号 `{issue_id}`。")
 
-    async def _reply_header(self, task: TaskContext) -> str:
-        """第 N 条回复脱离了原气泡，开头补任务标题，方便对上是哪个任务。"""
-        title = ""
-        if task.issue_id:
-            try:
-                title = await multica.get_title(task.issue_id)
-            except Exception:
-                LOG.exception("取任务标题失败 issue=%s", task.issue_id)
-        return REPLY_HEADER.format(title=title or task.request, seq=task.reply_seq)
-
     async def _deliver(self, task: TaskContext, approval: Approval) -> None:
-        """出站放行：首条答复落在原消息气泡里，第 N 条带任务标题另发一条。"""
+        """出站放行：首条答复落在原消息气泡里，第 N 条另发一条。"""
         task.reply_seq += 1
 
         landed = (task.reply_seq == FIRST_REPLY_SEQ
@@ -298,9 +287,7 @@ class Gateway:
         if landed:
             LOG.info("首条答复已落到气泡 task_id=%s", task.task_id)
         else:
-            header = await self._reply_header(task)
-            await self._to_origin(
-                task, cards.markdown(f"{header}\n\n{approval.content}"))
+            await self._to_origin(task, cards.markdown(approval.content))
             LOG.info("第 %s 条答复已另发 task_id=%s", task.reply_seq, task.task_id)
 
         self.store.save()
